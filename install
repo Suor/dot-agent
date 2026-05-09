@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO = Path(__file__).resolve().parent
+SKILLS_DIR = REPO / "skills"
+AGENT_SKILL_DIRS = {
+    "claude": Path.home() / ".claude" / "skills",
+    "codex": Path.home() / ".codex" / "skills",
+}
+
+
+@dataclass(frozen=True)
+class Action:
+    kind: str
+    src: Path | None = None
+    dst: Path | None = None
+    note: str = ""
+
+
+class Installer:
+    def __init__(self, dry_run: bool) -> None:
+        self.dry_run = dry_run
+        self.actions: list[Action] = []
+        self.seen_mkdirs: set[Path] = set()
+
+    def mkdir(self, dst: Path) -> None:
+        if dst in self.seen_mkdirs:
+            return
+        self.seen_mkdirs.add(dst)
+        self.actions.append(Action("mkdir", dst=dst))
+        if not self.dry_run:
+            dst.mkdir(parents=True, exist_ok=True)
+
+    def require_absent(self, dst: Path) -> None:
+        if dst.exists() or dst.is_symlink():
+            raise RuntimeError(f"target already exists, refusing to overwrite: {dst}")
+
+    def symlink(self, src: Path, dst: Path) -> None:
+        src = src.resolve()
+        self.actions.append(Action("symlink", src=src, dst=dst))
+        if self.dry_run:
+            return
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+
+    def run_script(self, skill_dir: Path, script: str) -> None:
+        src = skill_dir / script
+        if not src.is_file():
+            raise RuntimeError(f"missing install script for {skill_dir.name}: {src}")
+        self.actions.append(Action("run", src=src))
+        if not self.dry_run:
+            status = os.spawnv(os.P_WAIT, str(src), [str(src)])
+            if status != 0:
+                raise RuntimeError(f"install script failed for {skill_dir.name}: {src}")
+
+    def replace_with_symlink(self, src: Path, dst: Path) -> None:
+        if dst.is_symlink() and dst.resolve() == src.resolve():
+            self.actions.append(Action("keep", src=src.resolve(), dst=dst))
+            return
+        self.mkdir(dst.parent)
+        self.require_absent(dst)
+        self.symlink(src, dst)
+
+    def install_overlay_dir(self, skill_dir: Path, dst: Path, symlinks: dict[str, str]) -> None:
+        self.require_absent(dst)
+        self.mkdir(dst)
+
+        names = {p.name for p in skill_dir.iterdir() if p.name != "install.toml"}
+        names.update(symlinks)
+
+        for name in sorted(names):
+            src_name = symlinks.get(name, name)
+            src = skill_dir / src_name
+            target = dst / name
+            if not src.exists():
+                raise RuntimeError(f"missing source for {skill_dir.name}: {src}")
+            self.replace_with_symlink(src, target)
+
+    def print_summary(self) -> None:
+        for action in self.actions:
+            if action.kind == "mkdir":
+                print(f"mkdir   {action.dst}")
+            elif action.kind == "symlink":
+                print(f"link    {action.dst} -> {action.src}")
+            elif action.kind == "keep":
+                print(f"keep    {action.dst} -> {action.src}")
+            elif action.kind == "run":
+                print(f"run     {action.src}")
+
+
+def load_install_toml(skill_dir: Path) -> dict:
+    path = skill_dir / "install.toml"
+    if not path.exists():
+        return {}
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def agent_list(agent: str) -> list[str]:
+    if agent == "all":
+        return list(AGENT_SKILL_DIRS)
+    if agent not in AGENT_SKILL_DIRS:
+        raise RuntimeError(f"unknown agent: {agent}")
+    return [agent]
+
+
+def selected_skill_dirs(names: list[str]) -> list[Path]:
+    if not SKILLS_DIR.is_dir():
+        raise RuntimeError(f"missing skills directory: {SKILLS_DIR}")
+
+    if not names:
+        return sorted(p for p in SKILLS_DIR.iterdir() if p.is_dir())
+
+    skill_dirs = []
+    for name in names:
+        if "/" in name or name in {".", ".."}:
+            raise RuntimeError(f"invalid skill name: {name}")
+        skill_dir = SKILLS_DIR / name
+        if not skill_dir.is_dir():
+            raise RuntimeError(f"unknown skill: {name}")
+        skill_dirs.append(skill_dir)
+    return skill_dirs
+
+
+def install_skills(agent: str, names: list[str], dry_run: bool) -> None:
+    installer = Installer(dry_run=dry_run)
+    agents = agent_list(agent)
+    skill_dirs = selected_skill_dirs(names)
+
+    for skill_dir in skill_dirs:
+        meta = load_install_toml(skill_dir)
+        script = meta.get("script")
+        if script is not None:
+            if not isinstance(script, str):
+                raise RuntimeError(f"invalid script for {skill_dir.name}")
+            installer.run_script(skill_dir, script)
+        for agent_name in agents:
+            dst = AGENT_SKILL_DIRS[agent_name] / skill_dir.name
+            agent_meta = meta.get(agent_name, {})
+            symlinks = agent_meta.get("symlinks", {})
+            if symlinks:
+                installer.install_overlay_dir(skill_dir, dst, symlinks)
+            else:
+                installer.replace_with_symlink(skill_dir, dst)
+
+            hooks = meta.get("hooks", [])
+            if hooks and agent_name == "codex":
+                print(f"note    {skill_dir.name}: hooks declared, no codex hook installer yet", file=sys.stderr)
+            elif hooks and agent_name == "claude":
+                print(f"note    {skill_dir.name}: hooks declared, settings merge not implemented yet", file=sys.stderr)
+
+    installer.print_summary()
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Install dot-agent artifacts")
+    parser.add_argument("where", choices=["claude", "codex", "all"], help="where to install")
+    skills = parser.add_mutually_exclusive_group(required=True)
+    skills.add_argument("--all-skills", action="store_true", help="install all skills")
+    skills.add_argument("-s", "--skill", action="append", dest="skills", help="skill to install; may repeat")
+    parser.add_argument("--dry-run", action="store_true", help="print actions without changing files")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        names = [] if args.all_skills else args.skills
+        install_skills(args.where, names, args.dry_run)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
