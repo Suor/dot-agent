@@ -1,0 +1,8 @@
+script = "install.py"
+
+[[hooks]]
+type = "PreToolUse"
+command = "guard_fix.sh"
+
+[claude.symlinks]
+"SKILL.md" = "SKILL.claude.md"
