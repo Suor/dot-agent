@@ -93,24 +93,35 @@ Installer behavior:
 6. Do not manage complete agent settings files; only merge targeted fragments.
 
 
-## Future CLI
+## CLI
 
-Keep the current root `./install` script for now. If the tool grows, a later CLI may
-become:
+The root `./install` script remains as a compatibility wrapper. The primary CLI is:
 
 ```bash
+dot-agent install claude -s fix
 dot-agent install codex -s fix
 dot-agent extract claude -s new-skill
-dot-agent check claude
+dot-agent status
 ```
 
-Future commands:
+Current commands:
 
 - `install`: install from repo into agent home.
 - `extract`: copy from agent home into repo, without regenerating. If a skill already
-  exists, require `--force` or print a diff/report.
+  exists, diff the agent-home copy against the repo copy first. If they match, replace
+  the agent-home copy with the normal installed shape. If they differ, print a file-level
+  summary and stop. `--force` skips the check and extracts anyway. Installed shape means
+  a directory symlink for plain skills, or an overlay directory with per-file symlinks
+  for special cases such as Claude `fix`.
+- `status`: read-only comparison between repo skills, Claude skills, and Codex skills.
+  Output is an alphabetically sorted table. Agent columns encode the full state:
+  `link`, `install`, `copy`, `changed`, `new`, `partial`, or `-`.
+
+Future commands:
+
 - `check`: read-only verification. Show what is installed correctly, what exists in repo
   but is not installed, what exists in the agent but is unknown to repo, wrong targets,
   real dirs where symlinks are expected, broken symlinks, and special-case warnings.
 
-No implicit `all`: installing to every supported agent should remain explicit.
+No implicit `all`: installing to every supported agent should remain explicit. Extract
+does not support `all`; choose the source agent home explicitly.

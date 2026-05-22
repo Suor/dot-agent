@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import shutil
+import sys
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO = Path(__file__).resolve().parent
+SKILLS_DIR = REPO / "skills"
+AGENT_SKILL_DIRS = {
+    "claude": Path.home() / ".claude" / "skills",
+    "codex": Path.home() / ".codex" / "skills",
+}
+IGNORED_EXTRACT_NAMES = {".git", "__pycache__"}
+
+
+@dataclass(frozen=True)
+class Action:
+    kind: str
+    src: Path | None = None
+    dst: Path | None = None
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class SnapshotEntry:
+    kind: str
+    digest: str = ""
+
+
+class FileActions:
+    def __init__(self, dry_run: bool, assume_absent: set[Path] | None = None) -> None:
+        self.dry_run = dry_run
+        self.actions: list[Action] = []
+        self.seen_mkdirs: set[Path] = set()
+        self.assume_absent = assume_absent or set()
+
+    def is_assumed_absent(self, path: Path) -> bool:
+        if not self.dry_run:
+            return False
+        for absent in self.assume_absent:
+            if path == absent or path.is_relative_to(absent):
+                return True
+        return False
+
+    def mkdir(self, dst: Path) -> None:
+        if dst in self.seen_mkdirs:
+            return
+        if not self.is_assumed_absent(dst) and dst.exists():
+            return
+        self.seen_mkdirs.add(dst)
+        self.actions.append(Action("mkdir", dst=dst))
+        if not self.dry_run:
+            dst.mkdir(parents=True, exist_ok=True)
+
+    def require_absent(self, dst: Path) -> None:
+        if self.is_assumed_absent(dst):
+            return
+        if dst.exists() or dst.is_symlink():
+            raise RuntimeError(f"target already exists, refusing to overwrite: {dst}")
+
+    def symlink(self, src: Path, dst: Path) -> None:
+        src = src.resolve()
+        self.actions.append(Action("symlink", src=src, dst=dst))
+        if self.dry_run:
+            return
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+
+    def remove(self, dst: Path) -> None:
+        self.assume_absent.add(dst)
+        self.actions.append(Action("remove", dst=dst))
+        if self.dry_run:
+            return
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            raise RuntimeError(f"cannot remove missing path: {dst}")
+
+    def copy_path(self, src: Path, dst: Path, *, replace_existing: bool = True) -> None:
+        if self.is_assumed_absent(dst):
+            pass
+        elif replace_existing and (dst.exists() or dst.is_symlink()):
+            self.remove(dst)
+        elif dst.exists() or dst.is_symlink():
+            self.require_absent(dst)
+        self.mkdir(dst.parent)
+        self.actions.append(Action("copy", src=src, dst=dst))
+        if self.dry_run:
+            return
+        if src.is_dir():
+            shutil.copytree(src, dst, symlinks=False, ignore=shutil.ignore_patterns(*IGNORED_EXTRACT_NAMES))
+        else:
+            shutil.copy2(src, dst, follow_symlinks=True)
+
+    def copy_if_different_path(self, src: Path, dst: Path) -> None:
+        if dst.exists() or dst.is_symlink():
+            try:
+                if src.resolve() == dst.resolve():
+                    self.actions.append(Action("keep", src=src.resolve(), dst=dst))
+                    return
+            except FileNotFoundError:
+                pass
+        self.copy_path(src, dst)
+
+    def print_summary(self) -> None:
+        for action in self.actions:
+            if action.kind == "mkdir":
+                print(f"mkdir   {action.dst}")
+            elif action.kind == "symlink":
+                print(f"link    {action.dst} -> {action.src}")
+            elif action.kind == "keep":
+                print(f"keep    {action.dst} -> {action.src}")
+            elif action.kind == "run":
+                print(f"run     {action.src}")
+            elif action.kind == "copy":
+                print(f"copy    {action.src} -> {action.dst}")
+            elif action.kind == "remove":
+                print(f"remove  {action.dst}")
+
+
+class SkillDiff(RuntimeError):
+    def __init__(self, name: str, diffs: list[str]) -> None:
+        self.name = name
+        self.diffs = diffs
+        super().__init__(self.render())
+
+    def render(self) -> str:
+        lines = [f"skill differs in repo and agent home: {self.name}"]
+        lines.extend(f"  {line}" for line in self.diffs[:20])
+        remaining = len(self.diffs) - 20
+        if remaining > 0:
+            lines.append(f"  ... {remaining} more")
+        lines.append("use --force to extract anyway")
+        return "\n".join(lines)
+
+
+class Installer(FileActions):
+    def run_script(self, skill_dir: Path, script: str) -> None:
+        src = skill_dir / script
+        if not src.is_file():
+            raise RuntimeError(f"missing install script for {skill_dir.name}: {src}")
+        self.actions.append(Action("run", src=src))
+        if not self.dry_run:
+            status = os.spawnv(os.P_WAIT, str(src), [str(src)])
+            if status != 0:
+                raise RuntimeError(f"install script failed for {skill_dir.name}: {src}")
+
+    def replace_with_symlink(self, src: Path, dst: Path) -> None:
+        if dst.is_symlink() and dst.resolve() == src.resolve():
+            self.actions.append(Action("keep", src=src.resolve(), dst=dst))
+            return
+        self.mkdir(dst.parent)
+        self.require_absent(dst)
+        self.symlink(src, dst)
+
+    def install_overlay_dir(self, skill_dir: Path, dst: Path, symlinks: dict[str, str]) -> None:
+        self.require_absent(dst)
+        self.mkdir(dst)
+
+        names = {p.name for p in skill_dir.iterdir() if p.name != "install.toml"}
+        names.update(symlinks)
+
+        for name in sorted(names):
+            src_name = symlinks.get(name, name)
+            src = skill_dir / src_name
+            target = dst / name
+            if not src.exists():
+                raise RuntimeError(f"missing source for {skill_dir.name}: {src}")
+            self.replace_with_symlink(src, target)
+
+
+def validate_skill_name(name: str) -> None:
+    if "/" in name or name in {".", ".."}:
+        raise RuntimeError(f"invalid skill name: {name}")
+
+
+def load_install_toml(skill_dir: Path) -> dict:
+    path = skill_dir / "install.toml"
+    if not path.exists():
+        return {}
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def agent_list(agent: str) -> list[str]:
+    if agent == "all":
+        return list(AGENT_SKILL_DIRS)
+    if agent not in AGENT_SKILL_DIRS:
+        raise RuntimeError(f"unknown agent: {agent}")
+    return [agent]
+
+
+def selected_skill_dirs(names: list[str]) -> list[Path]:
+    if not SKILLS_DIR.is_dir():
+        raise RuntimeError(f"missing skills directory: {SKILLS_DIR}")
+
+    if not names:
+        return sorted(p for p in SKILLS_DIR.iterdir() if p.is_dir())
+
+    skill_dirs = []
+    for name in names:
+        validate_skill_name(name)
+        skill_dir = SKILLS_DIR / name
+        if not skill_dir.is_dir():
+            raise RuntimeError(f"unknown skill: {name}")
+        skill_dirs.append(skill_dir)
+    return skill_dirs
+
+
+def list_skill_names(root: Path) -> set[str]:
+    if not root.is_dir():
+        return set()
+    return {
+        p.name
+        for p in root.iterdir()
+        if (p.is_dir() or p.is_symlink()) and p.name not in IGNORED_EXTRACT_NAMES and not p.name.startswith(".")
+    }
+
+
+def install_skill_dirs(agent: str, skill_dirs: list[Path], installer: Installer) -> None:
+    agents = agent_list(agent)
+
+    for skill_dir in skill_dirs:
+        meta = load_install_toml(skill_dir)
+        script = meta.get("script")
+        if script is not None:
+            if not isinstance(script, str):
+                raise RuntimeError(f"invalid script for {skill_dir.name}")
+            installer.run_script(skill_dir, script)
+        for agent_name in agents:
+            dst = AGENT_SKILL_DIRS[agent_name] / skill_dir.name
+            agent_meta = meta.get(agent_name, {})
+            symlinks = agent_meta.get("symlinks", {})
+            if symlinks:
+                installer.install_overlay_dir(skill_dir, dst, symlinks)
+            else:
+                installer.replace_with_symlink(skill_dir, dst)
+
+            hooks = meta.get("hooks", [])
+            if hooks and agent_name == "codex":
+                print(f"note    {skill_dir.name}: hooks declared, no codex hook installer yet", file=sys.stderr)
+            elif hooks and agent_name == "claude":
+                print(f"note    {skill_dir.name}: hooks declared, settings merge not implemented yet", file=sys.stderr)
+
+
+def install_skills(agent: str, names: list[str], dry_run: bool) -> None:
+    installer = Installer(dry_run=dry_run)
+    install_skill_dirs(agent, selected_skill_dirs(names), installer)
+    installer.print_summary()
+
+
+def source_is_installed(src: Path, repo_skill_dir: Path) -> bool:
+    return src.is_symlink() and src.resolve() == repo_skill_dir.resolve()
+
+
+def expected_overlay_names(skill_dir: Path, symlinks: dict[str, str]) -> set[str]:
+    names = {p.name for p in skill_dir.iterdir() if p.name != "install.toml"}
+    names.update(symlinks)
+    return names
+
+
+def installed_status(agent_path: Path, repo_skill_dir: Path, symlinks: dict[str, str]) -> str:
+    if not agent_path.exists() and not agent_path.is_symlink():
+        return "missing"
+    if not repo_skill_dir.exists():
+        return "unknown"
+    if symlinks:
+        if not agent_path.is_dir() or agent_path.is_symlink():
+            return "copy"
+        expected_names = expected_overlay_names(repo_skill_dir, symlinks)
+        actual_paths = [p for p in agent_path.iterdir() if p.name not in IGNORED_EXTRACT_NAMES]
+        actual_names = {p.name for p in actual_paths}
+        has_symlinks = any(p.is_symlink() for p in actual_paths)
+        if actual_names != expected_names:
+            return "partial" if has_symlinks else "copy"
+        for name in expected_names:
+            src_name = symlinks.get(name, name)
+            src = repo_skill_dir / src_name
+            dst = agent_path / name
+            if not dst.is_symlink():
+                return "partial" if has_symlinks else "copy"
+            try:
+                if dst.resolve() != src.resolve():
+                    return "partial"
+            except FileNotFoundError:
+                return "partial"
+        return "installed"
+    if source_is_installed(agent_path, repo_skill_dir):
+        return "installed"
+    return "copy"
+
+
+def file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def snapshot_path(path: Path, prefix: Path = Path()) -> dict[Path, SnapshotEntry]:
+    if path.name in IGNORED_EXTRACT_NAMES:
+        return {}
+    if path.is_dir():
+        entries: dict[Path, SnapshotEntry] = {prefix: SnapshotEntry("dir")}
+        for child in sorted(path.iterdir(), key=lambda p: p.name):
+            entries.update(snapshot_path(child, prefix / child.name))
+        return entries
+    if path.exists():
+        return {prefix: SnapshotEntry("file", file_digest(path))}
+    return {}
+
+
+def snapshot_overlay_src(src: Path, symlinks: dict[str, str]) -> dict[Path, SnapshotEntry]:
+    entries: dict[Path, SnapshotEntry] = {Path(): SnapshotEntry("dir")}
+    for child in sorted(src.iterdir(), key=lambda p: p.name):
+        if child.name in IGNORED_EXTRACT_NAMES:
+            continue
+        dst_name = symlinks.get(child.name, child.name)
+        child_entries = snapshot_path(child, Path(dst_name))
+        for rel, entry in child_entries.items():
+            existing = entries.get(rel)
+            if existing is not None and existing != entry:
+                raise RuntimeError(f"multiple agent files map to different repo content: {rel}")
+            entries[rel] = entry
+    return entries
+
+
+def snapshot_target_keys(root: Path, keys: set[Path]) -> dict[Path, SnapshotEntry]:
+    entries: dict[Path, SnapshotEntry] = {Path(): SnapshotEntry("dir")}
+    for rel in sorted(keys):
+        if rel == Path():
+            continue
+        target = root / rel
+        if target.exists() or target.is_symlink():
+            entries.update(snapshot_path(target, rel))
+    return entries
+
+
+def summarize_snapshot_diff(source: dict[Path, SnapshotEntry], target: dict[Path, SnapshotEntry]) -> list[str]:
+    diffs: list[str] = []
+    for rel in sorted(source.keys() | target.keys()):
+        if rel == Path():
+            continue
+        src_entry = source.get(rel)
+        dst_entry = target.get(rel)
+        label = rel.as_posix()
+        if src_entry is None:
+            diffs.append(f"remove {label}")
+        elif dst_entry is None:
+            diffs.append(f"add {label}")
+        elif src_entry.kind != dst_entry.kind:
+            diffs.append(f"type {label}: repo {dst_entry.kind}, agent {src_entry.kind}")
+        elif src_entry.digest != dst_entry.digest:
+            diffs.append(f"change {label}")
+    return diffs
+
+
+def require_identical_or_report(name: str, source: dict[Path, SnapshotEntry], target: dict[Path, SnapshotEntry]) -> None:
+    diffs = summarize_snapshot_diff(source, target)
+    if diffs:
+        raise SkillDiff(name, diffs)
+
+
+def comparable_snapshots(agent_path: Path, repo_skill_dir: Path, symlinks: dict[str, str]) -> tuple[dict[Path, SnapshotEntry], dict[Path, SnapshotEntry]]:
+    if symlinks:
+        source_snapshot = snapshot_overlay_src(agent_path, symlinks)
+        target_snapshot = snapshot_target_keys(repo_skill_dir, set(source_snapshot))
+        return source_snapshot, target_snapshot
+    return snapshot_path(agent_path), snapshot_path(repo_skill_dir)
+
+
+def extract_overlay_skill(actions: FileActions, src: Path, repo_skill_dir: Path, symlinks: dict[str, str]) -> None:
+    if not src.is_dir():
+        raise RuntimeError(f"cannot overlay-extract non-directory skill: {src}")
+
+    actions.mkdir(repo_skill_dir)
+    for child in sorted(src.iterdir(), key=lambda p: p.name):
+        if child.name in IGNORED_EXTRACT_NAMES:
+            continue
+        dst_name = symlinks.get(child.name, child.name)
+        actions.copy_if_different_path(child, repo_skill_dir / dst_name)
+
+
+def extract_plain_skill(actions: FileActions, src: Path, repo_skill_dir: Path) -> None:
+    if repo_skill_dir.exists() or repo_skill_dir.is_symlink():
+        actions.remove(repo_skill_dir)
+    actions.copy_path(src, repo_skill_dir, replace_existing=False)
+
+
+def extract_one_skill(agent: str, name: str, force: bool, dry_run: bool) -> FileActions:
+    validate_skill_name(name)
+    src = AGENT_SKILL_DIRS[agent] / name
+    repo_skill_dir = SKILLS_DIR / name
+    if not src.exists() and not src.is_symlink():
+        raise RuntimeError(f"skill not found in {agent}: {src}")
+
+    actions = FileActions(dry_run=dry_run)
+    if source_is_installed(src, repo_skill_dir):
+        actions.actions.append(Action("keep", src=repo_skill_dir.resolve(), dst=src))
+        return actions
+
+    meta = load_install_toml(repo_skill_dir) if repo_skill_dir.is_dir() else {}
+    symlinks = meta.get(agent, {}).get("symlinks", {})
+    if symlinks and repo_skill_dir.exists():
+        if force:
+            extract_overlay_skill(actions, src, repo_skill_dir, symlinks)
+        else:
+            source_snapshot, target_snapshot = comparable_snapshots(src, repo_skill_dir, symlinks)
+            require_identical_or_report(name, source_snapshot, target_snapshot)
+    else:
+        if repo_skill_dir.exists() or repo_skill_dir.is_symlink():
+            if force:
+                extract_plain_skill(actions, src, repo_skill_dir)
+            else:
+                require_identical_or_report(name, snapshot_path(src), snapshot_path(repo_skill_dir))
+        else:
+            extract_plain_skill(actions, src, repo_skill_dir)
+
+    actions.remove(src)
+
+    installer = Installer(dry_run=dry_run, assume_absent=set(actions.assume_absent))
+    install_skill_dirs(agent, [repo_skill_dir], installer)
+    actions.actions.extend(installer.actions)
+    return actions
+
+
+def extract_skills(agent: str, names: list[str], force: bool, dry_run: bool) -> None:
+    if agent not in AGENT_SKILL_DIRS:
+        raise RuntimeError(f"unknown agent: {agent}")
+    if not names:
+        raise RuntimeError("extract requires at least one -s/--skill")
+
+    all_actions = FileActions(dry_run=dry_run)
+    for name in names:
+        actions = extract_one_skill(agent, name, force, dry_run)
+        all_actions.actions.extend(actions.actions)
+    all_actions.print_summary()
+
+
+def table(rows: list[list[str]]) -> str:
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    lines = []
+    for idx, row in enumerate(rows):
+        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+        if idx == 0:
+            lines.append("  ".join("-" * width for width in widths))
+    return "\n".join(lines)
+
+
+def agent_skill_status(agent: str, name: str) -> str:
+    repo_skill_dir = SKILLS_DIR / name
+    agent_path = AGENT_SKILL_DIRS[agent] / name
+    repo_present = repo_skill_dir.is_dir()
+    agent_present = agent_path.exists() or agent_path.is_symlink()
+    meta = load_install_toml(repo_skill_dir) if repo_present else {}
+    symlinks = meta.get(agent, {}).get("symlinks", {})
+
+    if not agent_present:
+        return "-"
+    if not repo_present:
+        return "new"
+
+    install = installed_status(agent_path, repo_skill_dir, symlinks)
+    if install == "installed":
+        return "install" if symlinks else "link"
+    if install == "partial":
+        return "partial"
+
+    try:
+        source_snapshot, target_snapshot = comparable_snapshots(agent_path, repo_skill_dir, symlinks)
+    except RuntimeError:
+        return "error"
+    return "changed" if summarize_snapshot_diff(source_snapshot, target_snapshot) else "copy"
+
+
+def status_skills() -> None:
+    names = set(list_skill_names(SKILLS_DIR))
+    for root in AGENT_SKILL_DIRS.values():
+        names.update(list_skill_names(root))
+
+    rows = [["skill", "HERE", "claude", "codex"]]
+    for name in sorted(names):
+        rows.append([
+            name,
+            "source" if (SKILLS_DIR / name).is_dir() else "-",
+            agent_skill_status("claude", name),
+            agent_skill_status("codex", name),
+        ])
+    print(table(rows))
+
+
+def add_skill_selection(parser: argparse.ArgumentParser, *, all_skills: bool, verb: str) -> None:
+    skills = parser.add_mutually_exclusive_group(required=True)
+    if all_skills:
+        skills.add_argument("--all-skills", action="store_true", help="install all skills")
+    skills.add_argument("-s", "--skill", action="append", dest="skills", help=f"skill to {verb}; may repeat")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Manage dot-agent artifacts")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    install_parser = subparsers.add_parser("install", help="install repo skills into an agent home")
+    install_parser.add_argument("where", choices=["claude", "codex", "all"], help="where to install")
+    add_skill_selection(install_parser, all_skills=True, verb="install")
+    install_parser.add_argument("--dry-run", action="store_true", help="print actions without changing files")
+
+    extract_parser = subparsers.add_parser("extract", help="copy agent-home skills into this repo")
+    extract_parser.add_argument("where", choices=["claude", "codex"], help="where to extract from")
+    add_skill_selection(extract_parser, all_skills=False, verb="extract")
+    extract_parser.add_argument("--force", action="store_true", help="replace an existing repo skill")
+    extract_parser.add_argument("--dry-run", action="store_true", help="print actions without changing files")
+
+    subparsers.add_parser("status", help="show repo, Claude, and Codex skill status")
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        if args.command == "install":
+            names = [] if args.all_skills else args.skills
+            install_skills(args.where, names, args.dry_run)
+        elif args.command == "extract":
+            extract_skills(args.where, args.skills, args.force, args.dry_run)
+        elif args.command == "status":
+            status_skills()
+        else:
+            raise RuntimeError(f"unknown command: {args.command}")
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
