@@ -27,6 +27,8 @@ Can run subagent and also CLI agents in parallel - `claude -p`, `gemini -p`, `co
 
 **Cut to the ask.** The plan contains only what the user's verbatim requests cover. Before declaring it done, re-read `user-requests.md` and delete anything not grounded there — your own "while we're at it" additions, reviewer suggestions the user didn't pick, machinery for distinctions the user never introduced. When the user trims ("throw out what I didn't say"), that's a signal you've been over-adding; default narrower next time.
 
+**Don't edit mid-discussion.** While a question is still being settled, only discuss; collect the resulting edits and apply them as one consolidated update once it is settled. Editing after every reply fixes unsettled (often wrong) conclusions and turns the plan into a transcript.
+
 **Compress, don't accumulate — and never drop.** Each update folds resolved threads into Decisions and cuts the prose they replace — a plan that only grows is a transcript, not a plan. But folding compresses wording, not content: everything established as a fact or decided keeps a written home in the plan doc; cutting a paragraph is legal only when its substance already lives elsewhere in the doc. An open question is open only while the user still has to decide: de-facto-decided ones (the user's later asks already build on an answer) move to Decisions; verify-during-implementation items move into a stage's check.
 
 **Reconcile on divergence.** When implementation is directed to contradict the plan (a goal reversed, a stage dropped, an open question mooted), update the plan doc in the same turn and call out the divergence — don't leave `plan.md` describing an abandoned decision, and don't wait to be asked.

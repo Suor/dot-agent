@@ -24,11 +24,12 @@ The user wants independent opinions from Gemini, Codex, GLM and Kimi (the latter
 
 2. **Write the prompt** to `ask_bros_question.txt` in your scratchpad directory (the session-specific path from your system prompt) via the Write tool. Below `$QFILE` stands for that full path.
 
-3. **Launch all CLIs in parallel** with `run_in_background: true`. Send all Bash calls in a single message so they run concurrently:
+3. **Launch all CLIs in parallel** with `run_in_background: true`. Send all Bash calls in a single message so they run concurrently.
+
+   **GLM and Kimi are currently unavailable — launch Gemini and Codex only.**
 
    - Gemini: `gemini --skip-trust --allowed-tools "run_shell_command(git log)" "run_shell_command(git diff)" "run_shell_command(git show)" "run_shell_command(git blame)" -p "$(cat $QFILE)"` (without the allowlist every shell call needs confirmation, which non-interactive mode auto-denies)
-   - Codex: `codex exec --sandbox read-only --skip-git-repo-check "$(cat $QFILE)" < /dev/null` (the flag is needed outside git repos; the stdin redirect stops it from waiting on piped input)
-   // NOTE: GLM, and Kimi disabled temporarily, skip them
+   - Codex: `codex exec --sandbox read-only --skip-git-repo-check -o "$(dirname $QFILE)/codex_answer.txt" "$(cat $QFILE)" < /dev/null` (`--skip-git-repo-check` is needed outside git repos; `-o` writes the final answer alone to that file, next to `$QFILE` in the scratchpad; the stdin redirect keeps it from blocking on an open stdin)
    - GLM: `opencode run -m opencode-go/glm-5.2 --agent plan "$(cat $QFILE)"`
    - Kimi: `opencode run -m opencode-go/kimi-k2.7-code --agent plan "$(cat $QFILE)"`
 
@@ -38,7 +39,7 @@ The user wants independent opinions from Gemini, Codex, GLM and Kimi (the latter
 
    Strip the CLI noise:
    - Gemini: drop the deprecation warnings (including the `--allowed-tools` one) and "Ripgrep is not available" line at the top.
-   - Codex: skip everything up to and including the echoed question; take the answer between the `codex` marker and `tokens used`.
+   - Codex: read the `codex_answer.txt` written by `-o` — it holds the answer alone, nothing to strip. The stdout log is only for diagnosing a failed run.
    - opencode (GLM/Kimi): drop the `> plan · <model>` header and the `→ <Tool> ...` tool-call lines (the agent may read files first); the answer is the prose after them.
 
 6. **Summarize for the user.** Keep it under ~400 words:
