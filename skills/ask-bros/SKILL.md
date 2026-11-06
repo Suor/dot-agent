@@ -29,7 +29,7 @@ The user wants independent opinions from Gemini, Codex, GLM and Kimi (the latter
    **GLM and Kimi are currently unavailable — launch Gemini and Codex only.**
 
    - Gemini: `gemini --skip-trust --allowed-tools "run_shell_command(git log)" "run_shell_command(git diff)" "run_shell_command(git show)" "run_shell_command(git blame)" -p "$(cat $QFILE)"` (without the allowlist every shell call needs confirmation, which non-interactive mode auto-denies)
-   - Codex: `codex exec --sandbox read-only --skip-git-repo-check -o "$(dirname $QFILE)/codex_answer.txt" "$(cat $QFILE)" < /dev/null` (`--skip-git-repo-check` is needed outside git repos; `-o` writes the final answer alone to that file, next to `$QFILE` in the scratchpad; the stdin redirect keeps it from blocking on an open stdin)
+   - Codex: `codex exec -m gpt-6-astra --sandbox read-only --skip-git-repo-check -o "$(dirname $QFILE)/codex_answer.txt" "$(cat $QFILE)" < /dev/null` (`--skip-git-repo-check` is needed outside git repos; `-o` writes the final answer alone to that file, next to `$QFILE` in the scratchpad; the stdin redirect keeps it from blocking on an open stdin; Codex has no `-m astra` alias, so the Astra slug is spelled out)
    - GLM: `opencode run -m opencode-go/glm-5.2 --agent plan "$(cat $QFILE)"`
    - Kimi: `opencode run -m opencode-go/kimi-k2.7-code --agent plan "$(cat $QFILE)"`
 
